@@ -47,6 +47,22 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
+    pub fn munmap(&mut self, vpn: VirtPageNum) {
+        self.areas[0].unmap_one(&mut self.page_table, vpn);
+    }
+    pub fn find_vpn(&self, vpn: VirtPageNum) -> bool {
+        let pte = self.translate(vpn);
+        match pte {
+            Some(x) => {
+                if x.is_valid() {
+                    return true;
+                } else {
+                    return false;
+                }
+            },
+            None => return false,
+        }
+    }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
         &mut self,

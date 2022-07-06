@@ -23,6 +23,11 @@ pub use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+pub use task::TaskInfo;
+use crate::timer::get_time_us;
+use crate::config::PAGE_SIZE;
+use crate::mm::{VirtPageNum, VPNRange, MapPermission, VirtAddr};
+
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -79,6 +84,9 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+
+        next_task.start_time = get_time_us();
+
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -135,6 +143,11 @@ impl TaskManager {
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
             inner.current_task = next;
+
+            if inner.tasks[next].start_time == 0 {
+                inner.tasks[next].start_time = get_time_us();
+            }
+
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
             drop(inner);
@@ -146,6 +159,86 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    fn get_current_taskinfo(&self, ti: *mut TaskInfo) -> isize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let now = get_time_us();
+        unsafe {
+            (*ti).status = inner.tasks[current].task_status;
+            (*ti).syscall_times = inner.tasks[current].taskinfo.syscall_times;
+            (*ti).time = (now - inner.tasks[current].start_time) / 1000;
+        }
+        0
+    }
+
+    fn record_current_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].taskinfo.syscall_times[syscall_id] += 1;
+    }
+
+    fn mmap(&self, start: usize, len: usize, prot: usize) -> isize {
+        if (start % PAGE_SIZE) != 0 ||
+        (prot & !0x7 != 0) || (prot & 0x7 == 0) {
+            return -1;
+        }
+        let mut length = len;
+        if len % PAGE_SIZE != 0 {
+            length = len + (PAGE_SIZE - len % PAGE_SIZE);
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let vpn_start = VirtPageNum::from(start / PAGE_SIZE);
+        let vpn_end = VirtPageNum::from((start + length) / PAGE_SIZE);
+        let vpn_range = VPNRange::new(vpn_start, vpn_end);
+        for vpn in vpn_range {
+            if inner.tasks[current].memory_set.find_vpn(vpn) {
+                return -1;
+            }
+        }
+        let permission = MapPermission::from_bits((prot as u8) << 1).unwrap() | MapPermission::U;
+        inner.tasks[current].memory_set.insert_framed_area(
+            VirtAddr::from(start),
+            VirtAddr::from(start + length),
+            permission
+        );
+        for vpn in vpn_range {
+            if false == inner.tasks[current].memory_set.find_vpn(vpn) {
+                return -1;
+            }
+        }
+        0
+    }
+
+    fn munmap(&self, start: usize, len: usize) -> isize {
+        if (start % PAGE_SIZE) != 0 {
+            return -1;
+        }
+        let mut length = len;
+        if len % PAGE_SIZE != 0 {
+            length = len + (PAGE_SIZE - len % PAGE_SIZE);
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let vpn_start = VirtPageNum::from(start / PAGE_SIZE);
+        let vpn_end = VirtPageNum::from((start + length) / PAGE_SIZE);
+        let vpn_range = VPNRange::new(vpn_start, vpn_end);
+        for vpn in vpn_range {
+            if !(inner.tasks[current].memory_set.find_vpn(vpn)) {
+                return -1;
+            }
+        }
+        for vpn in vpn_range {
+            inner.tasks[current].memory_set.munmap(vpn);
+        }
+        for vpn in vpn_range {
+            if true == inner.tasks[current].memory_set.find_vpn(vpn) {
+                return -1;
+            }
+        }
+        0
     }
 }
 
@@ -190,4 +283,22 @@ pub fn current_user_token() -> usize {
 /// Get the current 'Running' task's trap contexts.
 pub fn current_trap_cx() -> &'static mut TrapContext {
     TASK_MANAGER.get_current_trap_cx()
+}
+
+pub fn get_task_info(ti: *mut TaskInfo) -> isize {
+    TASK_MANAGER.get_current_taskinfo(ti)
+}
+
+pub fn record_current_syscall(syscall_id: usize) {
+    TASK_MANAGER.record_current_syscall(syscall_id);
+}
+
+/// map
+pub fn mmap(start: usize, len: usize, prot: usize) -> isize {
+    TASK_MANAGER.mmap(start, len, prot)
+}
+
+/// unmap
+pub fn munmap(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap(start, len)
 }
